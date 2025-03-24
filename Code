@@ -8,6 +8,10 @@ from functools import lru_cache
 import joblib
 import os
 from scipy.optimize import differential_evolution
+import tkinter as tk
+from tkinter import ttk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
 
 # --- Inverse Solver ---
 def inverse_loss(angles, target_r, fast_level=6):
@@ -226,80 +230,210 @@ def extrapolate_growth_ratio(ratios, first_diff, second_diff, max_extra_steps=10
 
     return r
 
+class TriangleResultWindow:
+    def __init__(self, title="Triangle Growth Visualizer"):
+        self.window = tk.Toplevel()
+        self.window.title(title)
+
+        # --- Text Results ---
+        self.result_box = tk.Text(self.window, width=60, height=12)
+        self.result_box.grid(row=0, column=0, padx=10, pady=5)
+
+        # --- Plot ---
+        self.fig, self.ax = plt.subplots(figsize=(6, 4))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.window)
+        self.canvas.get_tk_widget().grid(row=0, column=1, rowspan=3, padx=10, pady=10)
+
+        # --- X-Axis Zoom Controls ---
+        zoom_frame = ttk.LabelFrame(self.window, text="X-Axis Zoom (Level Range)")
+        zoom_frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+
+        self.xmin_var = tk.IntVar(value=1)
+        self.xmax_var = tk.IntVar(value=10)
+
+        ttk.Label(zoom_frame, text="Min Level").grid(row=0, column=0)
+        ttk.Entry(zoom_frame, textvariable=self.xmin_var, width=5).grid(row=0, column=1)
+
+        ttk.Label(zoom_frame, text="Max Level").grid(row=0, column=2)
+        ttk.Entry(zoom_frame, textvariable=self.xmax_var, width=5).grid(row=0, column=3)
+
+        ttk.Button(zoom_frame, text="Apply Zoom", command=self.update_zoom).grid(row=0, column=4, padx=5)
+
+        # --- Y-Axis Zoom Slider ---
+        yzoom_frame = ttk.LabelFrame(self.window, text="Y-Axis Zoom")
+        yzoom_frame.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
+
+        self.yzoom_slider = tk.DoubleVar(value=0.2)
+        ttk.Label(yzoom_frame, text="Zoom Buffer %").grid(row=0, column=0)
+        ttk.Scale(yzoom_frame, from_=0.01, to=0.5, variable=self.yzoom_slider, orient='horizontal', length=200).grid(row=0, column=1)
+        ttk.Button(yzoom_frame, text="Apply Zoom", command=self.update_zoom).grid(row=0, column=2, padx=5)
+
+    def show_results(self, df, angle1, angle2, angle3, final_ratio, asymptotic):
+        self.result_box.delete(1.0, tk.END)
+        self.result_box.insert(tk.END, f"Angles: {angle1:.2f}°, {angle2:.2f}°, {angle3:.2f}°\n")
+        self.result_box.insert(tk.END, f"Final Growth Ratio: {final_ratio:.6f}\n")
+        self.result_box.insert(tk.END, f"Asymptotic Estimate: {asymptotic:.6f}\n")
+        self.result_box.insert(tk.END, f"Difference: {asymptotic - final_ratio:.6f}\n")
+
+        self.last_df = df  # Save for zooming
+        self.plot_graph(df)
+
+    def show_inverse_result(self, result_dict):
+        self.result_box.delete(1.0, tk.END)
+        for key, value in result_dict.items():
+            self.result_box.insert(tk.END, f"{key}: {value}\n")
+
+    def plot_graph(self, df):
+        self.ax.clear()
+
+        levels = df['Level']
+        phi_sums = df['Sum of ϕ values (S_n)']
+        ratios = df['Ratio S_n / S_n-1'].tolist()
+        first_diff = df['First Difference'].tolist()
+        second_diff = df['Second Difference'].tolist()
+
+        # Begin extrapolation
+        extra_steps = 10
+        extended_levels = list(levels)
+        extended_ratios = [r for r in ratios if r is not None]
+
+        # Safety check
+        if not extended_ratios or not first_diff or all(v is None for v in first_diff):
+            self.ax.set_title("Insufficient data to plot growth ratios.")
+            self.canvas.draw()
+            return
+
+        try:
+            r = extended_ratios[-1]
+            d1 = [v for v in first_diff if v is not None][-1]
+
+            recent_d1_ratios = [
+                first_diff[i] / first_diff[i - 1]
+                for i in range(len(first_diff) - 3, len(first_diff))
+                if first_diff[i] is not None and first_diff[i - 1] and first_diff[i - 1] != 0
+            ]
+            decay_rate = sum(recent_d1_ratios) / len(recent_d1_ratios) if recent_d1_ratios else 0.95
+            decay_rate = min(max(decay_rate, 0), 1)
+
+            for step in range(1, extra_steps + 1):
+                d1 *= decay_rate
+                r += d1
+                extended_levels.append(len(extended_levels) + 1)
+                extended_ratios.append(r)
+
+        except Exception as e:
+            print("Extrapolation error:", e)
+            self.ax.set_title("Error during extrapolation.")
+            self.canvas.draw()
+            return
+
+        # Plot raw data
+        self.ax.plot(levels, phi_sums, label='ϕ Sum')
+        self.ax.plot(levels, df['Ratio S_n / S_n-1'], label='Growth Ratio (computed)')
+        self.ax.plot(levels, df['First Difference'], label='1st Diff')
+        self.ax.plot(levels, df['Second Difference'], label='2nd Diff')
+
+        # Extrapolated ratio (orange dashed)
+        self.ax.plot(extended_levels[len(ratios):], extended_ratios[len(ratios):],
+                     label='Growth Ratio (extrapolated)', linestyle='--', color='orange')
+
+        # Plot asymptote
+        asymptote_value = extended_ratios[-1]
+        if np.isfinite(asymptote_value):
+            self.ax.axhline(y=asymptote_value, color='gray', linestyle='dashed', linewidth=1.2,
+                            label=f"Asymptote ≈ {asymptote_value:.4f}")
+            self.ax.text(extended_levels[-1] + 0.5, asymptote_value, f"{asymptote_value:.4f}",
+                         color='gray', va='center', ha='left', fontsize=9, style='italic')
+
+        # Y-axis zoom with protection
+        try:
+            all_ratios = np.array(extended_ratios)
+            if len(all_ratios) > 0 and np.all(np.isfinite(all_ratios)):
+                ymin, ymax = np.min(all_ratios), np.max(all_ratios)
+                buffer = (ymax - ymin) * self.yzoom_slider.get() if ymax > ymin else 0.05
+                self.ax.set_ylim(ymin - buffer, ymax + buffer)
+            else:
+                self.ax.set_ylim(0.9, 1.1)  # fallback
+        except Exception as e:
+            print("Warning: Y-axis zoom failed:", e)
+            self.ax.set_ylim(0.9, 1.1)
+
+        # X-axis zoom
+        xmin = self.xmin_var.get()
+        xmax = self.xmax_var.get()
+        self.ax.set_xlim(xmin, xmax)
+
+        self.ax.set_title("ϕ Growth Metrics (w/ extrapolation)")
+        self.ax.set_xlabel("Level")
+        self.ax.legend()
+        self.ax.grid(True)
+        self.canvas.draw()
+
+    def update_zoom(self):
+        if hasattr(self, "last_df"):
+            self.plot_graph(self.last_df)
 
 
 # --- User Interface ---
 def main():
+    import tkinter as tk  # Ensure Tkinter is loaded in main thread
+
     print("\n Triangle Recursive Fingerprint Calculator")
-    mode = input("Choose mode: [1] Random triangles  [2] Manual angle input\n> ")
+    mode = input("Choose mode: [1] Random triangles  [2] Manual input [3] Inverse solver\n> ")
+
+    root = tk.Tk()
+    root.withdraw()  # Hide root window
 
     if mode == '1':
-        num_triangles = int(input("How many random triangles would you like to generate? "))
+        num_triangles = int(input("How many random triangles? "))
         max_level = int(input("Max recursion level: "))
-
-        summary_data = []
 
         for i in range(num_triangles):
             angle1 = random.uniform(10, 80)
             angle2 = random.uniform(10, 80)
             try:
                 A, B, C, angle3 = triangle_from_angles(angle1, angle2)
-                print(f"\n🗺️ Triangle {i+1} — Angles: {angle1:.2f}°, {angle2:.2f}°, {angle3:.2f}°")
                 df, ratios, first_diff, second_diff = process_triangle_from_coords(A, B, C, max_level)
-                print(df.to_string(index=False))
-                final_ratio = ratios[-1] if ratios[-1] is not None else 0
                 asymptotic = extrapolate_growth_ratio(ratios, first_diff, second_diff)
-                print(f"→ Asymptotic Growth Ratio Estimate: {asymptotic:.6f}")
-                summary_data.append({
-                    "Triangle #": i+1,
-                    "Angle 1": round(angle1, 2),
-                    "Angle 2": round(angle2, 2),
-                    "Angle 3": round(angle3, 2),
-                    "Final Growth Ratio": final_ratio,
-                    "Asymptotic Estimate": asymptotic
-                })
-            except ValueError as e:
-                print(f"Skipping invalid triangle: {e}")
+                final_ratio = [r for r in ratios if r is not None][-1]
 
-        summary_df = pd.DataFrame(summary_data)
+                # GUI output
+                viewer = TriangleResultWindow(f"Triangle #{i+1}")
+                viewer.show_results(df, angle1, angle2, angle3, final_ratio, asymptotic)
 
-        print("\n Final Growth Ratio Summary for All Triangles")
-        print(summary_df.to_string(index=False))
-
-        # Add summarization of extrapolated vs real final growth ratios
-        print("\n Summary of Extrapolated vs Final Ratios")
-        summary_df["Difference"] = summary_df["Asymptotic Estimate"] - summary_df["Final Growth Ratio"]
-        print(summary_df[["Triangle #", "Final Growth Ratio", "Asymptotic Estimate", "Difference"]].to_string(index=False))
-
-        avg_difference = summary_df["Difference"].abs().mean()
-        print(f"\n Average absolute difference between final and extrapolated ratios: {avg_difference:.6f}")
-
-
-        
+            except Exception as e:
+                print(f"Error: {e}")
 
     elif mode == '2':
-        angle1 = float(input("Enter angle 1 (degrees): "))
-        angle2 = float(input("Enter angle 2 (degrees): "))
+        angle1 = float(input("Enter angle 1 (°): "))
+        angle2 = float(input("Enter angle 2 (°): "))
         max_level = int(input("Max recursion level: "))
 
         A, B, C, angle3 = triangle_from_angles(angle1, angle2)
-        print(f"\n Triangle — Angles: {angle1:.2f}°, {angle2:.2f}°, {angle3:.2f}°")
         df, ratios, first_diff, second_diff = process_triangle_from_coords(A, B, C, max_level)
-        print(df.to_string(index=False))
         asymptotic = extrapolate_growth_ratio(ratios, first_diff, second_diff)
-        print(f"\n→ Asymptotic Growth Ratio Estimate: {asymptotic:.6f}")
+        final_ratio = [r for r in ratios if r is not None][-1]
+
+        # GUI output
+        viewer = TriangleResultWindow("Manual Triangle")
+        viewer.show_results(df, angle1, angle2, angle3, final_ratio, asymptotic)
 
     elif mode == '3':
         target_r = float(input("Enter target growth ratio (r): "))
-        max_level = int(input("Max recursion level (e.g. 12): "))
-        print("\n Solving... this may take a few seconds...")
-        result = solve_for_target_ratio(target_r, max_level)
-        print("\n Inverse Solution Result")
-        for key, value in result.items():
-            print(f"{key}: {value}")
-            
+        max_level = int(input("Max recursion level: "))
+
+        print("\nSolving...")
+        result = solve_for_target_ratio(target_r, fast_level=6, final_level=max_level)
+
+        # GUI output
+        viewer = TriangleResultWindow("Inverse Solver Result")
+        viewer.show_inverse_result(result)
+
     else:
         print("Invalid mode selected.")
+
+    joblib.dump(cache, CACHE_FILE)
+    root.mainloop()
 
 
 
@@ -307,4 +441,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

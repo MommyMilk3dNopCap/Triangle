@@ -1,0 +1,310 @@
+import numpy as np
+import pandas as pd
+import math
+import matplotlib.pyplot as plt
+from tqdm import tqdm  # <- for progress bar
+import random
+from functools import lru_cache
+import joblib
+import os
+from scipy.optimize import differential_evolution
+
+# --- Inverse Solver ---
+def inverse_loss(angles, target_r, fast_level=6):
+    angle1, angle2 = angles
+    if angle1 <= 0 or angle2 <= 0 or angle1 + angle2 >= 179.9:
+        return 1e6  # Invalid triangle
+
+    try:
+        A, B, C, _ = triangle_from_angles(angle1, angle2)
+        df, ratios, first_diff, second_diff = process_triangle_from_coords(A, B, C, fast_level)
+        r_est = extrapolate_growth_ratio(ratios, first_diff, second_diff)
+        return abs(r_est - target_r)
+    except Exception:
+        return 1e6
+
+def solve_for_target_ratio(target_r, fast_level=6, final_level=12):
+    bounds = [(1.0, 89.0), (1.0, 89.0)]
+    result = differential_evolution(inverse_loss, bounds, args=(target_r, fast_level), tol=1e-6, maxiter=1000)
+
+    if result.success:
+        angle1, angle2 = result.x
+        angle3 = 180 - angle1 - angle2
+        A, B, C, _ = triangle_from_angles(angle1, angle2)
+        df, ratios, _, _ = process_triangle_from_coords(A, B, C, final_level)
+        r_final = ratios[-1] if ratios[-1] is not None else 0
+        return {
+            "Angle 1": round(angle1, 4),
+            "Angle 2": round(angle2, 4),
+            "Angle 3": round(angle3, 4),
+            "Final r (level {}):".format(final_level): round(r_final, 6),
+            "Target r": round(target_r, 6),
+            "Loss at fast level": round(result.fun, 8)
+        }
+    else:
+        return {"Error": "No solution found", "Details": result.message}
+# Persistent cache setup
+CACHE_FILE = "triangle_cache.joblib"
+
+if os.path.exists(CACHE_FILE):
+    cache = joblib.load(CACHE_FILE)
+else:
+    cache = {}
+
+
+@lru_cache(maxsize=None)
+def cached_triangle_area(A, B, C):
+    return 0.5 * abs((A[0]*(B[1]-C[1]) + B[0]*(C[1]-A[1]) + C[0]*(A[1]-B[1])))
+
+@lru_cache(maxsize=None)
+def cached_centroid(A, B, C):
+    return ((A[0]+B[0]+C[0])/3, (A[1]+B[1]+C[1])/3)
+
+@lru_cache(maxsize=None)
+def cached_angle_ratios(A, B, C):
+    a = np.linalg.norm(np.subtract(B, C))
+    b = np.linalg.norm(np.subtract(C, A))
+    c = np.linalg.norm(np.subtract(A, B))
+    angle_A = math.acos((b**2 + c**2 - a**2) / (2 * b * c))
+    angle_B = math.acos((a**2 + c**2 - b**2) / (2 * a * c))
+    angle_C = math.pi - angle_A - angle_B
+    angles = np.array([angle_A, angle_B, angle_C])
+    return tuple(angles / sum(angles))
+
+
+# --- Utility Functions ---
+def triangle_cache_key(A, B, C, level):
+    angles = cached_angle_ratios(A, B, C)
+    return (angles, level)
+
+
+def triangle_area(A, B, C):
+    return 0.5 * abs((A[0]*(B[1]-C[1]) + B[0]*(C[1]-A[1]) + C[0]*(A[1]-B[1])))
+
+def centroid(A, B, C):
+    return (A + B + C) / 3
+
+def angle_ratios(A, B, C):
+    a = np.linalg.norm(B - C)
+    b = np.linalg.norm(C - A)
+    c = np.linalg.norm(A - B)
+    angle_A = math.acos((b**2 + c**2 - a**2) / (2 * b * c))
+    angle_B = math.acos((a**2 + c**2 - b**2) / (2 * a * c))
+    angle_C = math.pi - angle_A - angle_B
+    angles = np.array([angle_A, angle_B, angle_C])
+    return angles / sum(angles)
+
+def phi(area_norm, angle_ratios):
+    return area_norm * sum(angle_ratios * np.log1p(angle_ratios))
+
+def iterative_fingerprint(A, B, C, max_level, A0):
+    key = triangle_cache_key(A, B, C, max_level)
+    if key in cache:
+        return cache[key]
+
+    triangles = [(A, B, C)]
+    total_phi = 0
+    for level in range(max_level):
+        new_triangles = []
+        for tri in triangles:
+            G = cached_centroid(*tri)
+            sub_triangles = [
+                (tri[0], tri[1], G),
+                (tri[1], tri[2], G),
+                (tri[2], tri[0], G)
+            ]
+            for sub in sub_triangles:
+                area = cached_triangle_area(*sub)
+                area_norm = area / A0
+                angles = cached_angle_ratios(*sub)
+                value = phi(area_norm, angles)
+                total_phi += value
+                new_triangles.append(sub)
+        triangles = new_triangles
+
+    cache[key] = total_phi  # Save to cache
+    return total_phi
+
+
+
+def process_triangle_from_coords(A, B, C, max_level):
+    A, B, C = tuple(A), tuple(B), tuple(C)
+    
+    A0 = cached_triangle_area(A, B, C)
+    sums, ratios, first_diff, second_diff = [], [], [], []
+
+    prev_sum = None
+    prev_ratio = None
+    prev_first_diff = None
+
+    for level in tqdm(range(1, max_level + 1), desc="Processing Levels"):
+        val = iterative_fingerprint(A, B, C, level, A0)
+        sums.append(val)
+
+        # Calculate Ratio
+        if prev_sum is not None:
+            ratio = val / prev_sum
+            ratios.append(ratio)
+        else:
+            ratios.append(None)
+
+        # Calculate First Difference
+        if prev_ratio is not None and ratios[-1] is not None:
+            fd = ratios[-1] - prev_ratio
+            first_diff.append(fd)
+        else:
+            first_diff.append(None)
+
+        # Calculate Second Difference
+        if prev_first_diff is not None and first_diff[-1] is not None:
+            sd = first_diff[-1] - prev_first_diff
+            second_diff.append(sd)
+        else:
+            second_diff.append(None)
+
+        prev_sum = val
+        prev_ratio = ratios[-1]
+        prev_first_diff = first_diff[-1]
+
+    df = pd.DataFrame({
+        'Level': list(range(1, max_level + 1)),
+        'Sum of ϕ values (S_n)': sums,
+        'Ratio S_n / S_n-1': ratios,
+        'First Difference': first_diff,
+        'Second Difference': second_diff
+    })
+
+    return df, ratios, first_diff, second_diff
+
+
+
+def triangle_from_angles(angle1_deg, angle2_deg):
+    angle3_deg = 180 - angle1_deg - angle2_deg
+    if angle3_deg <= 0:
+        raise ValueError("The sum of the two angles must be less than 180 degrees.")
+    A = np.array([0.0, 0.0])
+    B = np.array([1.0, 0.0])
+    angle1_rad = math.radians(angle1_deg)
+    angle3_rad = math.radians(angle3_deg)
+    a = 1.0
+    b = a * math.sin(angle1_rad) / math.sin(angle3_rad)
+    cx = math.cos(angle1_rad) * b
+    cy = math.sin(angle1_rad) * b
+    C = np.array([cx, cy])
+    return A, B, C, angle3_deg
+
+# --- Estimation System ---
+def extrapolate_growth_ratio(ratios, first_diff, second_diff, max_extra_steps=100, threshold=1e-10):
+    r = [v for v in ratios if v is not None][-1]
+    d1 = [v for v in first_diff if v is not None][-1]
+
+    # Calculate decay rate based on recent first differences
+    recent_d1_ratios = [
+        first_diff[i] / first_diff[i - 1]
+        for i in range(len(first_diff) - 3, len(first_diff))
+        if first_diff[i] is not None and first_diff[i - 1] and first_diff[i - 1] != 0
+    ]
+    
+    if not recent_d1_ratios:
+        return r
+    
+    decay_rate = sum(recent_d1_ratios) / len(recent_d1_ratios)
+    decay_rate = min(max(decay_rate, 0), 1)
+
+    print(f"\n--- Extrapolation Debug (Corrected) ---")
+    
+
+    for step in range(max_extra_steps):
+        d1 *= decay_rate  # Now correctly decaying d1 directly
+        r += d1
+
+        
+
+        if abs(d1) < threshold:
+            print("→ Converged (threshold reached)\n")
+            break
+
+    return r
+
+
+
+# --- User Interface ---
+def main():
+    print("\n Triangle Recursive Fingerprint Calculator")
+    mode = input("Choose mode: [1] Random triangles  [2] Manual angle input\n> ")
+
+    if mode == '1':
+        num_triangles = int(input("How many random triangles would you like to generate? "))
+        max_level = int(input("Max recursion level: "))
+
+        summary_data = []
+
+        for i in range(num_triangles):
+            angle1 = random.uniform(10, 80)
+            angle2 = random.uniform(10, 80)
+            try:
+                A, B, C, angle3 = triangle_from_angles(angle1, angle2)
+                print(f"\n🗺️ Triangle {i+1} — Angles: {angle1:.2f}°, {angle2:.2f}°, {angle3:.2f}°")
+                df, ratios, first_diff, second_diff = process_triangle_from_coords(A, B, C, max_level)
+                print(df.to_string(index=False))
+                final_ratio = ratios[-1] if ratios[-1] is not None else 0
+                asymptotic = extrapolate_growth_ratio(ratios, first_diff, second_diff)
+                print(f"→ Asymptotic Growth Ratio Estimate: {asymptotic:.6f}")
+                summary_data.append({
+                    "Triangle #": i+1,
+                    "Angle 1": round(angle1, 2),
+                    "Angle 2": round(angle2, 2),
+                    "Angle 3": round(angle3, 2),
+                    "Final Growth Ratio": final_ratio,
+                    "Asymptotic Estimate": asymptotic
+                })
+            except ValueError as e:
+                print(f"Skipping invalid triangle: {e}")
+
+        summary_df = pd.DataFrame(summary_data)
+
+        print("\n Final Growth Ratio Summary for All Triangles")
+        print(summary_df.to_string(index=False))
+
+        # Add summarization of extrapolated vs real final growth ratios
+        print("\n Summary of Extrapolated vs Final Ratios")
+        summary_df["Difference"] = summary_df["Asymptotic Estimate"] - summary_df["Final Growth Ratio"]
+        print(summary_df[["Triangle #", "Final Growth Ratio", "Asymptotic Estimate", "Difference"]].to_string(index=False))
+
+        avg_difference = summary_df["Difference"].abs().mean()
+        print(f"\n Average absolute difference between final and extrapolated ratios: {avg_difference:.6f}")
+
+
+        
+
+    elif mode == '2':
+        angle1 = float(input("Enter angle 1 (degrees): "))
+        angle2 = float(input("Enter angle 2 (degrees): "))
+        max_level = int(input("Max recursion level: "))
+
+        A, B, C, angle3 = triangle_from_angles(angle1, angle2)
+        print(f"\n Triangle — Angles: {angle1:.2f}°, {angle2:.2f}°, {angle3:.2f}°")
+        df, ratios, first_diff, second_diff = process_triangle_from_coords(A, B, C, max_level)
+        print(df.to_string(index=False))
+        asymptotic = extrapolate_growth_ratio(ratios, first_diff, second_diff)
+        print(f"\n→ Asymptotic Growth Ratio Estimate: {asymptotic:.6f}")
+
+    elif mode == '3':
+        target_r = float(input("Enter target growth ratio (r): "))
+        max_level = int(input("Max recursion level (e.g. 12): "))
+        print("\n Solving... this may take a few seconds...")
+        result = solve_for_target_ratio(target_r, max_level)
+        print("\n Inverse Solution Result")
+        for key, value in result.items():
+            print(f"{key}: {value}")
+            
+    else:
+        print("Invalid mode selected.")
+
+
+
+    joblib.dump(cache, CACHE_FILE)
+
+if __name__ == "__main__":
+    main()
+    
